@@ -1,0 +1,66 @@
+runtime:
+  mode: live
+  dry_run: true
+  start_paused: true
+  log_level: INFO
+
+markets:
+  enabled:
+    - market_1
+    - market_2
+
+thresholds:
+  min_edge_threshold: 0.01
+  failure_buffer: 0.002
+  default_fee_rate: 0.002
+  max_slippage_bps: 20
+
+risk:
+  max_position_per_market: 500.0
+  max_total_exposure: 1500.0
+  max_hourly_loss: 100.0
+  max_daily_loss: 300.0
+  max_open_orders_per_market: 8
+  p95_latency_ms_limit: 500
+  reject_rate_limit: 0.25
+  drawdown_limit: 150.0
+  ws_health_timeout_sec: 15
+  picked_off_spike_count: 5
+  picked_off_window_sec: 60
+
+order:
+  default_ttl_ms: 15000
+  min_order_lifetime_ms: 1200
+  max_cancels_per_sec_per_market: 5
+  intent_price_epsilon: 0.0001
+  intent_size_epsilon: 0.1
+
+rate_limits:
+  global:
+    tokens: 100000
+    window_sec: 600
+  post_order:
+    burst_tokens: 3500
+    burst_window_sec: 10
+    sustained_tokens: 36000
+    sustained_window_sec: 600
+  delete_order:
+    burst_tokens: 3000
+    burst_window_sec: 10
+    sustained_tokens: 30000
+    sustained_window_sec: 600
+  adaptive_backoff_base_ms: 100
+  adaptive_backoff_max_ms: 5000
+
+persistence:
+  db_path: ./data/bot.db
+  flush_interval_sec: 2
+
+backtest:
+  replay_speed: 1.0
+  use_recorded_fills: true
+
+control:
+  enable_cli: true
+  telegram_enabled: false
+  telegram_allowlist: []
