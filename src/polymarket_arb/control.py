@@ -20,7 +20,7 @@ class CLICommandAPI:
         self.log = logging.getLogger("CLICommandAPI")
 
     async def run(self, bus: CommandBus) -> None:
-        self.log.info("command api ready: pause|resume|flatten|reload|set|backtest|stop")
+        self.log.info("command api ready: pause|resume|flatten(cancel mode from config)|reload|set|backtest|stop")
         loop = asyncio.get_running_loop()
         while True:
             line = await loop.run_in_executor(None, input, "> ")

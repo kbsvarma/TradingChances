@@ -3,6 +3,8 @@ runtime:
   dry_run: true
   start_paused: true
   log_level: INFO
+  event_queue_maxsize: 50000
+  event_queue_high_watermark: 30000
 
 markets:
   enabled:
@@ -27,6 +29,7 @@ risk:
   ws_health_timeout_sec: 15
   picked_off_spike_count: 5
   picked_off_window_sec: 60
+  picked_off_freshness_ms: 250
 
 order:
   default_ttl_ms: 15000
@@ -55,6 +58,9 @@ rate_limits:
 persistence:
   db_path: ./data/bot.db
   flush_interval_sec: 2
+  buffer_maxsize: 20000
+  buffer_high_watermark: 15000
+  flush_timeout_sec: 3
 
 backtest:
   replay_speed: 1.0
@@ -64,3 +70,24 @@ control:
   enable_cli: true
   telegram_enabled: false
   telegram_allowlist: []
+
+trading_safety:
+  flatten_mode: cancel_only
+
+gamma:
+  gamma_api_url: https://gamma-api.polymarket.com
+
+# Optional static mapping; used if Gamma unavailable.
+market_metadata:
+  market_1:
+    yes_token_id: token_1_yes
+    no_token_id: token_1_no
+    tick_size: 0.001
+    min_order_size: 1.0
+    fee_rate: 0.002
+  market_2:
+    yes_token_id: token_2_yes
+    no_token_id: token_2_no
+    tick_size: 0.001
+    min_order_size: 1.0
+    fee_rate: 0.002

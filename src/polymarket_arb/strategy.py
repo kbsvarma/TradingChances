@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from polymarket_arb.market_rules import MarketRulesProvider
 from polymarket_arb.types import BookState, Intent, IntentType, Position
 
 
@@ -9,7 +10,6 @@ from polymarket_arb.types import BookState, Intent, IntentType, Position
 class StrategyParams:
     min_edge_threshold: float
     failure_buffer: float
-    default_fee_rate: float
     max_slippage_bps: float
     ttl_ms: int
 
@@ -36,22 +36,13 @@ class SlippageModel:
         return abs(avg - ref)
 
 
-class FeeProvider:
-    def __init__(self, default_fee_rate: float) -> None:
-        self.default_fee_rate = default_fee_rate
-        self._cache: dict[str, float] = {}
-
-    async def get_fee_rate(self, market_id: str) -> float:
-        return self._cache.get(market_id, self.default_fee_rate)
-
-
 class Strategy:
     """Deterministic strategy: no randomness, no LLM."""
 
-    def __init__(self, params: StrategyParams, slippage_model: SlippageModel, fee_provider: FeeProvider) -> None:
+    def __init__(self, params: StrategyParams, slippage_model: SlippageModel, rules_provider: MarketRulesProvider) -> None:
         self.params = params
         self.slippage_model = slippage_model
-        self.fee_provider = fee_provider
+        self.rules_provider = rules_provider
 
     async def compute_intents(
         self,
@@ -72,8 +63,8 @@ class Strategy:
         if best_yes is None or best_no is None:
             return [Intent(IntentType.NOOP, market_id, token_yes, reason="empty_book")]
 
-        fee_rate = await self.fee_provider.get_fee_rate(market_id)
-        size = 1.0
+        fee_rate = await self.rules_provider.get_fee_rate(market_id, token_yes)
+        size = self.rules_provider.get_min_order_size(market_id, token_yes)
         slip_yes = self.slippage_model.estimate(book_yes, "buy", size)
         slip_no = self.slippage_model.estimate(book_no, "buy", size)
         slippage = slip_yes + slip_no

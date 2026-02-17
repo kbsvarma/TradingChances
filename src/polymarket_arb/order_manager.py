@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from polymarket_arb.config import OrderConfig
+from polymarket_arb.market_rules import MarketRulesProvider
 from polymarket_arb.normalizer import Normalizer
 from polymarket_arb.types import Intent, IntentType, ManagedOrder, OrderStatus
 
@@ -25,11 +26,13 @@ class OrderManager:
         execution,
         rate_limiter,
         normalizer: Normalizer,
+        rules_provider: MarketRulesProvider,
     ) -> None:
         self.cfg = cfg
         self.execution = execution
         self.rate_limiter = rate_limiter
         self.normalizer = normalizer
+        self.rules_provider = rules_provider
         self.log = logging.getLogger("OrderManager")
 
         self.orders_by_client_id: dict[str, ManagedOrder] = {}
@@ -37,23 +40,33 @@ class OrderManager:
         self.semantic_index: dict[str, str] = {}
         self.cancel_windows: dict[str, deque[float]] = defaultdict(deque)
         self._intent_seen: set[str] = set()
+        self._intent_seen_ts: dict[str, float] = {}
+        self._intent_seen_ttl_sec = 2.0
 
     def _semantic_key(self, intent: Intent) -> str:
-        return f"{intent.market_id}:{intent.token_id}:{intent.side}:{intent.price}:{intent.size}"
+        q_price, p_ticks = self.rules_provider.quantize_price(intent.market_id, intent.token_id, float(intent.price or 0.0))
+        q_size, s_units = self.rules_provider.quantize_size(intent.market_id, intent.token_id, float(intent.size or 0.0))
+        _ = q_price, q_size
+        return f"{intent.market_id}:{intent.token_id}:{intent.side}:{p_ticks}:{s_units}"
 
     def _dedupe_key(self, intent: Intent) -> str:
-        return f"{intent.intent_type}:{intent.market_id}:{intent.token_id}:{intent.side}:{intent.price}:{intent.size}:{intent.order_id}"
+        if intent.intent_type == IntentType.PLACE:
+            return f"{intent.intent_type}:{self._semantic_key(intent)}"
+        return f"{intent.intent_type}:{intent.market_id}:{intent.token_id}:{intent.order_id}"
 
     async def process_intent(self, intent: Intent, risk_breach: bool = False) -> OrderDecision:
         if intent.intent_type == IntentType.NOOP:
             return OrderDecision(False, "noop")
 
+        self._prune_intent_seen()
         dedupe = self._dedupe_key(intent)
         if dedupe in self._intent_seen:
             return OrderDecision(False, "intent_duplicate")
         self._intent_seen.add(dedupe)
+        self._intent_seen_ts[dedupe] = time.time()
         if len(self._intent_seen) > 20000:
             self._intent_seen.clear()
+            self._intent_seen_ts.clear()
 
         if intent.intent_type == IntentType.PLACE:
             return await self._handle_place(intent)
@@ -64,15 +77,18 @@ class OrderManager:
     async def _handle_place(self, intent: Intent) -> OrderDecision:
         if None in (intent.side, intent.price, intent.size):
             return OrderDecision(False, "missing_place_fields")
-        if not self.normalizer.validate_order(intent.price, intent.size):
+
+        q_price, _ = self.rules_provider.quantize_price(intent.market_id, intent.token_id, float(intent.price))
+        q_size, _ = self.rules_provider.quantize_size(intent.market_id, intent.token_id, float(intent.size))
+        if not self.normalizer.validate_order(intent.market_id, intent.token_id, q_price, q_size):
             return OrderDecision(False, "tick_or_size_invalid")
 
-        semantic_key = self._semantic_key(intent)
+        semantic_key = f"{intent.market_id}:{intent.token_id}:{intent.side}:{self.rules_provider.quantize_price(intent.market_id, intent.token_id, q_price)[1]}:{self.rules_provider.quantize_size(intent.market_id, intent.token_id, q_size)[1]}"
         existing = self.semantic_index.get(semantic_key)
         if existing and self._is_live(existing):
             return OrderDecision(False, "semantic_duplicate", client_order_id=existing)
-        # Replace fallback policy: one live order per market/token/side semantic lane.
-        conflict = self._find_live_conflict(intent)
+
+        conflict = self._find_live_conflict(intent.market_id, intent.token_id, str(intent.side), q_price, q_size)
         if conflict is not None:
             cancel_decision = await self._handle_cancel(
                 Intent(
@@ -93,10 +109,10 @@ class OrderManager:
             client_order_id=client_order_id,
             market_id=intent.market_id,
             token_id=intent.token_id,
-            side=intent.side,
-            price=float(intent.price),
-            size=float(intent.size),
-            remaining_size=float(intent.size),
+            side=str(intent.side),
+            price=q_price,
+            size=q_size,
+            remaining_size=q_size,
             created_ts=now,
             ttl_ms=ttl_ms,
             status=OrderStatus.SENT,
@@ -109,9 +125,9 @@ class OrderManager:
         result = await self.execution.place_order(
             market_id=intent.market_id,
             token_id=intent.token_id,
-            side=intent.side,
-            price=float(intent.price),
-            size=float(intent.size),
+            side=str(intent.side),
+            price=q_price,
+            size=q_size,
             client_order_id=client_order_id,
             ttl_ms=ttl_ms,
         )
@@ -177,9 +193,15 @@ class OrderManager:
         order.last_update_ts = time.time()
         if order.remaining_size <= 0:
             order.status = OrderStatus.FILLED
-            order.status = OrderStatus.CLOSED
         else:
             order.status = OrderStatus.PARTIAL
+
+    def on_close(self, client_order_id: str) -> None:
+        order = self.orders_by_client_id.get(client_order_id)
+        if order is None:
+            return
+        order.status = OrderStatus.CLOSED
+        order.last_update_ts = time.time()
 
     def on_cancel(self, client_order_id: str) -> None:
         order = self.orders_by_client_id.get(client_order_id)
@@ -246,17 +268,24 @@ class OrderManager:
             return False
         return order.status in {OrderStatus.SENT, OrderStatus.ACKED, OrderStatus.PARTIAL, OrderStatus.CANCEL_SENT}
 
-    def _find_live_conflict(self, intent: Intent) -> ManagedOrder | None:
+    def _find_live_conflict(self, market_id: str, token_id: str, side: str, price: float, size: float) -> ManagedOrder | None:
         for order in self.orders_by_client_id.values():
-            if order.market_id != intent.market_id:
+            if order.market_id != market_id:
                 continue
-            if order.token_id != intent.token_id:
+            if order.token_id != token_id:
                 continue
-            if order.side != intent.side:
+            if order.side != side:
                 continue
             if order.status not in {OrderStatus.SENT, OrderStatus.ACKED, OrderStatus.PARTIAL, OrderStatus.CANCEL_SENT}:
                 continue
-            if order.price == intent.price and order.size == intent.size:
+            if abs(order.price - price) < 1e-12 and abs(order.size - size) < 1e-12:
                 continue
             return order
         return None
+
+    def _prune_intent_seen(self) -> None:
+        now = time.time()
+        stale = [k for k, ts in self._intent_seen_ts.items() if (now - ts) > self._intent_seen_ttl_sec]
+        for k in stale:
+            self._intent_seen_ts.pop(k, None)
+            self._intent_seen.discard(k)

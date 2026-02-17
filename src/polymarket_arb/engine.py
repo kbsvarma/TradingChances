@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict, deque
 from dataclasses import asdict
 
 from polymarket_arb.backtest import Backtester
@@ -12,13 +11,15 @@ from polymarket_arb.command_bus import CommandBus
 from polymarket_arb.config import BotConfig, load_config, required_env
 from polymarket_arb.control import CLICommandAPI
 from polymarket_arb.execution import ExecutionAdapter
+from polymarket_arb.market_registry import MarketRegistry
+from polymarket_arb.market_rules import MarketRulesProvider
 from polymarket_arb.metrics import Metrics, PickedOffDetector
 from polymarket_arb.normalizer import Normalizer
 from polymarket_arb.order_manager import OrderManager
 from polymarket_arb.persistence import Persistence
 from polymarket_arb.rate_limiter import RateLimiter
 from polymarket_arb.risk import RiskManager
-from polymarket_arb.strategy import FeeProvider, SlippageModel, Strategy, StrategyParams
+from polymarket_arb.strategy import SlippageModel, Strategy, StrategyParams
 from polymarket_arb.types import Command, CommandType, EngineState, EventType, FillRecord, Intent, IntentType, NormalizedEvent
 from polymarket_arb.ws_market import MarketWSClient
 from polymarket_arb.ws_user import UserWSClient
@@ -32,27 +33,39 @@ class TradingEngine:
         self.env = required_env()
         self.log = logging.getLogger("TradingEngine")
 
-        self.event_q: asyncio.Queue[NormalizedEvent] = asyncio.Queue(maxsize=200000)
+        self.registry = MarketRegistry.from_config(cfg.raw, cfg.markets)
+        self.rules_provider = MarketRulesProvider(
+            registry=self.registry,
+            default_tick_size=0.001,
+            default_min_order_size=1.0,
+            default_fee_rate=cfg.thresholds.default_fee_rate,
+        )
+
+        self.event_q: asyncio.Queue[NormalizedEvent] = asyncio.Queue(maxsize=cfg.runtime.event_queue_maxsize)
         self.book_store = BookStore()
-        self.normalizer = Normalizer()
+        self.normalizer = Normalizer(self.rules_provider)
         self.command_bus = CommandBus()
-        self.persistence = Persistence(cfg.persistence.db_path, cfg.persistence.flush_interval_sec)
+        self.persistence = Persistence(
+            cfg.persistence.db_path,
+            cfg.persistence.flush_interval_sec,
+            cfg.persistence.buffer_maxsize,
+            cfg.persistence.buffer_high_watermark,
+        )
 
         self.strategy = Strategy(
             params=StrategyParams(
                 min_edge_threshold=cfg.thresholds.min_edge_threshold,
                 failure_buffer=cfg.thresholds.failure_buffer,
-                default_fee_rate=cfg.thresholds.default_fee_rate,
                 max_slippage_bps=cfg.thresholds.max_slippage_bps,
                 ttl_ms=cfg.order.default_ttl_ms,
             ),
             slippage_model=SlippageModel(),
-            fee_provider=FeeProvider(cfg.thresholds.default_fee_rate),
+            rules_provider=self.rules_provider,
         )
         self.risk = RiskManager(cfg.risk)
         self.rate_limiter = RateLimiter(cfg.raw["rate_limits"])
         self.execution = ExecutionAdapter(dry_run=cfg.runtime.dry_run, env=self.env)
-        self.order_manager = OrderManager(cfg.order, self.execution, self.rate_limiter, self.normalizer)
+        self.order_manager = OrderManager(cfg.order, self.execution, self.rate_limiter, self.normalizer, self.rules_provider)
         self.metrics = Metrics()
         self.picked_off = PickedOffDetector()
 
@@ -60,6 +73,7 @@ class TradingEngine:
             ws_url=self.env["CLOB_WS_URL"],
             rest_url=self.env["CLOB_REST_URL"],
             markets=cfg.markets,
+            registry=self.registry,
             normalizer=self.normalizer,
             out_queue=self.event_q,
             book_store=self.book_store,
@@ -77,12 +91,13 @@ class TradingEngine:
 
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
-        self.market_tokens: dict[str, set[str]] = {m: set() for m in cfg.markets}
         self.enabled_markets = set(cfg.markets)
-        self.picked_off_events: dict[str, deque[float]] = defaultdict(deque)
 
     async def start(self) -> None:
         await self.persistence.init()
+        await self.registry.refresh_from_gamma(self.cfg.gamma_url, self.cfg.markets)
+        self._validate_registry()
+
         self.command_bus.subscribe(self._on_command)
         self.risk.state = EngineState.PAUSED if self.cfg.runtime.start_paused else EngineState.RUNNING
 
@@ -99,13 +114,7 @@ class TradingEngine:
         if self.cfg.raw["control"].get("enable_cli", True):
             self._tasks.append(asyncio.create_task(CLICommandAPI().run(self.command_bus), name="cli_commands"))
 
-        self.log.info(
-            "engine started",
-            extra={
-                "event_type": "engine_start",
-                "correlation_id": "startup",
-            },
-        )
+        self.log.info("engine started", extra={"event_type": "engine_start", "correlation_id": "startup"})
         await self._stop.wait()
         await self.shutdown()
 
@@ -115,11 +124,18 @@ class TradingEngine:
         for task in self._tasks:
             if not task.done():
                 task.cancel()
-        await self.persistence.stop()
+        await self.persistence.stop(self.cfg.persistence.flush_timeout_sec)
+
+    def _validate_registry(self) -> None:
+        for market_id in list(self.enabled_markets):
+            if self.registry.get(market_id) is None:
+                self.enabled_markets.discard(market_id)
+                self.log.error("market disabled: missing yes/no token mapping", extra={"market_id": market_id})
 
     async def _on_command(self, cmd: Command) -> None:
         if cmd.type == CommandType.PAUSE:
             self.risk.transition(EngineState.PAUSED)
+            await self.persistence.flush_with_timeout(self.cfg.persistence.flush_timeout_sec)
             self.log.warning("trading paused")
         elif cmd.type == CommandType.RESUME:
             if self.risk.state != EngineState.SAFE:
@@ -131,6 +147,7 @@ class TradingEngine:
             self.risk.transition(EngineState.SAFE)
         elif cmd.type == CommandType.MARKETS_ON:
             self.enabled_markets.update(set(cmd.payload.get("markets", [])))
+            self._validate_registry()
         elif cmd.type == CommandType.MARKETS_OFF:
             self.enabled_markets -= set(cmd.payload.get("markets", []))
         elif cmd.type == CommandType.RELOAD_CONFIG:
@@ -139,12 +156,8 @@ class TradingEngine:
         elif cmd.type == CommandType.SET_PARAMS:
             self._apply_params(cmd.payload)
         elif cmd.type == CommandType.BACKTEST:
-            report = await Backtester(self.cfg).run()
-            self.log.info(
-                "backtest_report=%s",
-                report,
-                extra={"event_type": "backtest_report", "correlation_id": "command"},
-            )
+            report = await Backtester(self.cfg, self.registry).run()
+            self.log.info("backtest_report=%s", report, extra={"event_type": "backtest_report", "correlation_id": "command"})
         elif cmd.type == CommandType.STOP:
             self._stop.set()
 
@@ -224,25 +237,25 @@ class TradingEngine:
                 continue
 
             if event.event_type == EventType.ORDER_BOOK_UPDATE:
-                if event.token_id:
-                    self.market_tokens.setdefault(event.market_id, set()).add(str(event.token_id))
                 await self._run_decision_cycle(event.market_id, recv_ts)
 
     async def _run_decision_cycle(self, market_id: str, recv_ts: float) -> None:
-        tokens = sorted(self.market_tokens.get(market_id, set()))
-        if len(tokens) < 2:
+        meta = self.registry.get(market_id)
+        if meta is None:
+            self.enabled_markets.discard(market_id)
+            self.log.error("market disabled: registry missing", extra={"market_id": market_id})
             return
-        token_yes, token_no = tokens[0], tokens[1]
-        book_yes = self.book_store.get(market_id, token_yes)
-        book_no = self.book_store.get(market_id, token_no)
+
+        book_yes = self.book_store.get(market_id, meta.yes_token_id)
+        book_no = self.book_store.get(market_id, meta.no_token_id)
 
         intents = await self.strategy.compute_intents(
             book_yes=book_yes,
             book_no=book_no,
             positions=self.risk.positions,
             market_id=market_id,
-            token_yes=token_yes,
-            token_no=token_no,
+            token_yes=meta.yes_token_id,
+            token_no=meta.no_token_id,
         )
         decision_ts = time.time()
         self.metrics.observe_latency("ws_recv_to_decision", (decision_ts - recv_ts) * 1000)
@@ -297,12 +310,36 @@ class TradingEngine:
     async def _health_loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(1)
+            if self.event_q.qsize() > self.cfg.runtime.event_queue_high_watermark:
+                self.log.error("event queue high watermark, pausing and resyncing")
+                self.risk.transition(EngineState.PAUSED)
+                await self._shed_load()
+                await self.market_ws.force_resync_all()
+
+            if self.persistence.queue.qsize() > self.cfg.persistence.buffer_high_watermark:
+                self.log.error("persistence queue high watermark, pausing and flushing")
+                self.risk.transition(EngineState.PAUSED)
+                await self.persistence.flush_with_timeout(self.cfg.persistence.flush_timeout_sec)
+
             should_trip, reason = self.risk.evaluate_circuit_breakers()
             if should_trip and self.risk.state == EngineState.RUNNING:
                 self.log.error("kill switch triggered", extra={"event_type": "kill_switch", "correlation_id": reason})
                 self.risk.transition(EngineState.FLATTENING)
                 await self._cancel_all(risk_breach=True)
                 self.risk.transition(EngineState.SAFE)
+
+    async def _shed_load(self) -> None:
+        keep: list[NormalizedEvent] = []
+        target = self.cfg.runtime.event_queue_high_watermark // 2
+        while self.event_q.qsize() > target:
+            try:
+                ev = self.event_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if ev.event_type in {EventType.FILL, EventType.ORDER_ACK, EventType.CANCEL, EventType.REJECT}:
+                keep.append(ev)
+        for ev in keep:
+            await self.event_q.put(ev)
 
     async def _ttl_loop(self) -> None:
         while not self._stop.is_set():
@@ -324,8 +361,46 @@ class TradingEngine:
                     risk_breach=risk_breach,
                 )
 
+    async def _unwind_positions(self) -> None:
+        for pos_key, pos in list(self.risk.positions.items()):
+            if abs(pos.qty) <= 1e-9:
+                continue
+            book = self.book_store.get(pos.market_id, pos.token_id)
+            if not book:
+                continue
+            if pos.qty > 0:
+                px = book.best_bid()
+                side = "sell"
+                slip_ref = book.best_ask() or px
+            else:
+                px = book.best_ask()
+                side = "buy"
+                slip_ref = book.best_bid() or px
+            if px is None or slip_ref is None or slip_ref <= 0:
+                continue
+            slippage_bps = abs(px - slip_ref) / slip_ref * 10000
+            if slippage_bps > self.cfg.thresholds.max_slippage_bps:
+                continue
+            await self.order_manager.process_intent(
+                Intent(
+                    intent_type=IntentType.PLACE,
+                    market_id=pos.market_id,
+                    token_id=pos.token_id,
+                    side=side,
+                    price=px,
+                    size=abs(pos.qty),
+                    ttl_ms=self.cfg.order.default_ttl_ms,
+                    maker_or_taker="taker",
+                    reason=f"flatten:{pos_key}",
+                ),
+                risk_breach=True,
+            )
+
     async def _flatten_all(self) -> None:
         await self._cancel_all(risk_breach=True)
+        mode = self.cfg.trading_safety.flatten_mode
+        if mode == "cancel_and_unwind":
+            await self._unwind_positions()
 
     async def _snapshot_loop(self) -> None:
         while not self._stop.is_set():
@@ -354,31 +429,23 @@ class TradingEngine:
                     avg_price=pos.avg_price,
                 )
 
-            # Sparse book snapshots for replay/debug.
             for (market_id, token_id), book in list(self.book_store.books.items())[:50]:
                 bids = [{"price": x.price, "size": x.size} for x in book.bids[:5]]
                 asks = [{"price": x.price, "size": x.size} for x in book.asks[:5]]
                 await self.persistence.record_book_snapshot(market_id, token_id, bids, asks)
 
     def _handle_picked_off(self, fill: FillRecord) -> None:
-        book = self.book_store.get(fill.market_id, fill.token_id)
-        if book is None:
+        snap = self.book_store.closest_snapshot(
+            fill.market_id,
+            fill.token_id,
+            fill.ts,
+            max_age_ms=self.cfg.risk.picked_off_freshness_ms,
+        )
+        if snap is None:
             return
-        post_fill_best = book.best_bid() if fill.side == "buy" else book.best_ask()
+        post_fill_best = snap.best_bid() if fill.side == "buy" else snap.best_ask()
         if post_fill_best is None:
             return
         if not self.picked_off.is_picked_off(fill.price, post_fill_best, fill.side):
             return
-        now = time.time()
-        dq = self.picked_off_events[fill.market_id]
-        dq.append(now)
-        window = self.cfg.risk.picked_off_window_sec
-        while dq and (now - dq[0]) > window:
-            dq.popleft()
-        if len(dq) >= self.cfg.risk.picked_off_spike_count:
-            self.enabled_markets.discard(fill.market_id)
-            self.risk.transition(EngineState.PAUSED)
-            self.log.error(
-                "picked_off_spike_pause",
-                extra={"event_type": "picked_off_spike", "market_id": fill.market_id, "correlation_id": "risk"},
-            )
+        self.risk.on_picked_off(fill.ts)

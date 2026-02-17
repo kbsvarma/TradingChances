@@ -17,6 +17,7 @@ class RiskSnapshot:
     p95_latency_ms: float
     drawdown: float
     ws_healthy: bool
+    picked_off_spike: bool
 
 
 @dataclass(slots=True)
@@ -29,13 +30,14 @@ class RiskManager:
     pnl_day_events: deque[tuple[float, float]] = field(default_factory=deque)
     rejects: deque[tuple[float, int]] = field(default_factory=deque)
     latencies_ms: deque[float] = field(default_factory=deque)
+    picked_off_events: deque[tuple[float, int]] = field(default_factory=deque)
     ws_last_seen_ts: float = 0.0
     peak_equity: float = 0.0
     equity: float = 0.0
 
     def transition(self, target: EngineState) -> None:
         legal = {
-            EngineState.RUNNING: {EngineState.PAUSED, EngineState.SAFE},
+            EngineState.RUNNING: {EngineState.PAUSED, EngineState.SAFE, EngineState.FLATTENING},
             EngineState.PAUSED: {EngineState.RUNNING, EngineState.FLATTENING, EngineState.SAFE},
             EngineState.FLATTENING: {EngineState.SAFE, EngineState.PAUSED},
             EngineState.SAFE: {EngineState.PAUSED},
@@ -55,13 +57,20 @@ class RiskManager:
         self.rejects.append((ts, 1))
         self._trim(self.rejects, 60)
 
+    def on_picked_off(self, ts: float) -> None:
+        self.picked_off_events.append((ts, 1))
+        self._trim(self.picked_off_events, self.cfg.picked_off_window_sec)
+
     def on_fill(self, fill: FillRecord) -> None:
         key = f"{fill.market_id}:{fill.token_id}"
         pos = self.positions.setdefault(key, Position(fill.market_id, fill.token_id))
         sign = 1 if fill.side == "buy" else -1
-        new_qty = pos.qty + (sign * fill.size)
+        old_qty = pos.qty
+        new_qty = old_qty + (sign * fill.size)
         if new_qty != 0:
-            pos.avg_price = ((pos.avg_price * pos.qty) + (fill.price * sign * fill.size)) / new_qty
+            pos.avg_price = ((pos.avg_price * old_qty) + (fill.price * sign * fill.size)) / new_qty
+        else:
+            pos.avg_price = 0.0
         pos.qty = new_qty
 
     def on_pnl(self, pnl_delta: float, ts: float | None = None) -> None:
@@ -109,6 +118,8 @@ class RiskManager:
             return False, "latency_limit"
         if snap.drawdown > self.cfg.drawdown_limit:
             return False, "drawdown_limit"
+        if snap.picked_off_spike:
+            return False, "picked_off_spike"
         if not snap.ws_healthy:
             return False, "ws_unhealthy"
         return True, "ok"
@@ -121,6 +132,8 @@ class RiskManager:
             return True, "reject_rate"
         if snap.drawdown > self.cfg.drawdown_limit:
             return True, "drawdown"
+        if snap.picked_off_spike:
+            return True, "picked_off_spike"
         if not snap.ws_healthy:
             return True, "ws_health"
         if abs(snap.hourly_pnl) > self.cfg.max_hourly_loss:
@@ -134,9 +147,11 @@ class RiskManager:
         self._trim(self.pnl_hour_events, 3600)
         self._trim(self.pnl_day_events, 86400)
         self._trim(self.rejects, 60)
+        self._trim(self.picked_off_events, self.cfg.picked_off_window_sec)
         p95 = self._p95(self.latencies_ms)
         reject_rate = len(self.rejects) / 60.0
         ws_healthy = (now - self.ws_last_seen_ts) <= self.cfg.ws_health_timeout_sec
+        picked_off_spike = len(self.picked_off_events) >= self.cfg.picked_off_spike_count
         return RiskSnapshot(
             exposure=self._exposure(),
             hourly_pnl=sum(x[1] for x in self.pnl_hour_events),
@@ -145,6 +160,7 @@ class RiskManager:
             p95_latency_ms=p95,
             drawdown=self.peak_equity - self.equity,
             ws_healthy=ws_healthy,
+            picked_off_spike=picked_off_spike,
         )
 
     def _exposure(self) -> float:

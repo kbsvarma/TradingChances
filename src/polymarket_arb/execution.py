@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 class ExecutionAdapter:
     """Thin wrapper around py-clob-client calls; deterministic and strategy-free."""
 
-    def __init__(self, dry_run: bool, env: dict[str, str]) -> None:
+    def __init__(self, dry_run: bool, env: dict[str, str], max_in_flight: int = 8) -> None:
         self.dry_run = dry_run
         self.env = env
         self.log = logging.getLogger("ExecutionAdapter")
         self._clob = None
+        self._sem = asyncio.Semaphore(max_in_flight)
         if not dry_run:
             self._init_client()
 
@@ -37,6 +39,10 @@ class ExecutionAdapter:
             self.dry_run = True
             self._clob = None
 
+    async def _call_sync(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        async with self._sem:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+
     async def place_order(
         self,
         market_id: str,
@@ -57,8 +63,8 @@ class ExecutionAdapter:
             }
 
         try:
-            # In real production, construct and sign EIP-712 order via py-clob-client helper.
-            response = self._clob.create_order(  # type: ignore[attr-defined]
+            response = await self._call_sync(
+                self._clob.create_order,  # type: ignore[attr-defined]
                 token_id=token_id,
                 side=side,
                 price=price,
@@ -88,7 +94,7 @@ class ExecutionAdapter:
             return {"ok": True, "status_code": 200, "order_id": order_id, "sent_ts": time.time()}
 
         try:
-            response = self._clob.cancel(order_id)  # type: ignore[attr-defined]
+            response = await self._call_sync(self._clob.cancel, order_id)  # type: ignore[attr-defined]
             return {"ok": True, "status_code": 200, "order_id": order_id, "raw": response, "sent_ts": time.time()}
         except Exception as exc:
             return {"ok": False, "status_code": 500, "order_id": order_id, "error": str(exc), "sent_ts": time.time()}

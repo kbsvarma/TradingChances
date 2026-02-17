@@ -4,9 +4,13 @@ import asyncio
 import json
 import logging
 
-import websockets
+try:
+    import websockets
+except ModuleNotFoundError:  # pragma: no cover
+    websockets = None  # type: ignore[assignment]
 
 from polymarket_arb.types import NormalizedEvent
+from polymarket_arb.wss_auth import build_user_subscribe_payload, redact_payload
 
 
 class UserWSClient:
@@ -24,6 +28,8 @@ class UserWSClient:
         self._stop.set()
 
     async def run_forever(self) -> None:
+        if websockets is None:
+            raise RuntimeError("websockets package is required for UserWSClient")
         backoff = 1
         while not self._stop.is_set():
             try:
@@ -44,13 +50,10 @@ class UserWSClient:
                 backoff = min(backoff * 2, 30)
 
     async def _subscribe(self, ws) -> None:
-        payload = {
-            "type": "subscribe",
-            "channel": "user",
-            "auth": {
-                "apiKey": self.auth.get("api_key", ""),
-                "secret": self.auth.get("api_secret", ""),
-                "passphrase": self.auth.get("api_passphrase", ""),
-            },
-        }
+        payload = build_user_subscribe_payload(
+            api_key=self.auth.get("api_key", ""),
+            secret=self.auth.get("api_secret", ""),
+            passphrase=self.auth.get("api_passphrase", ""),
+        )
+        self.log.info("user ws subscribe payload prepared: %s", redact_payload(payload))
         await ws.send(json.dumps(payload))

@@ -3,13 +3,13 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from polymarket_arb.market_rules import MarketRulesProvider
 from polymarket_arb.types import EventType, NormalizedEvent
 
 
 class Normalizer:
-    def __init__(self, tick_size: float = 0.001, min_order_size: float = 1.0) -> None:
-        self.tick_size = tick_size
-        self.min_order_size = min_order_size
+    def __init__(self, rules_provider: MarketRulesProvider) -> None:
+        self.rules_provider = rules_provider
 
     def from_market_ws(self, raw: dict[str, Any]) -> NormalizedEvent | None:
         recv_ts = time.time()
@@ -62,8 +62,10 @@ class Normalizer:
             correlation_id=raw.get("id") or raw.get("client_order_id"),
         )
 
-    def validate_order(self, price: float, size: float) -> bool:
-        if size < self.min_order_size:
+    def validate_order(self, market_id: str, token_id: str, price: float, size: float) -> bool:
+        min_size = self.rules_provider.get_min_order_size(market_id, token_id)
+        if size < min_size:
             return False
-        ticks = round(price / self.tick_size)
-        return abs((ticks * self.tick_size) - price) < 1e-9
+        tick_size = self.rules_provider.get_tick_size(market_id, token_id)
+        ticks = round(price / tick_size)
+        return abs((ticks * tick_size) - price) < 1e-9
