@@ -63,6 +63,7 @@ persistence:
   flush_timeout_sec: 3
 
 backtest:
+  initial_capital: 10000.0
   replay_speed: 1.0
   use_recorded_fills: true
 

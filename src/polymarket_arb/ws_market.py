@@ -21,6 +21,27 @@ from polymarket_arb.orderbook_snapshot import fetch_token_orderbook
 from polymarket_arb.types import NormalizedEvent
 
 
+def is_book_anomalous(
+    bids: list[dict],
+    asks: list[dict],
+    market_active: bool,
+    require_nonempty_active: bool = True,
+) -> bool:
+    if any(float(x.get("size", 0.0)) < 0 for x in bids + asks):
+        return True
+    if require_nonempty_active and market_active and (not bids and not asks):
+        return True
+    if bids and asks:
+        try:
+            best_bid = max(float(x.get("price", 0.0)) for x in bids)
+            best_ask = min(float(x.get("price", 0.0)) for x in asks)
+            if best_bid >= best_ask:
+                return True
+        except Exception:
+            return True
+    return False
+
+
 class MarketWSClient:
     """Public market websocket client with reconnect + snapshot resync."""
 
@@ -95,6 +116,10 @@ class MarketWSClient:
         p = event.payload
         bids = p.get("bids", [])
         asks = p.get("asks", [])
+        active = bool(p.get("market_active", True))
+        if is_book_anomalous(bids=bids, asks=asks, market_active=active, require_nonempty_active=True):
+            raise ValueError("book anomaly detected")
+
         self.book_store.upsert(
             market_id=event.market_id,
             token_id=str(event.token_id),
@@ -102,7 +127,7 @@ class MarketWSClient:
             asks=asks,
             recv_ts=event.recv_ts,
             exchange_ts=event.exchange_ts,
-            active=bool(p.get("market_active", True)),
+            active=active,
             require_nonempty_if_active=True,
         )
 
@@ -117,10 +142,9 @@ class MarketWSClient:
             return False
 
     async def resync_market(self, market_id: str) -> None:
-        # Sequence-independent recovery: discard stream assumptions, snapshot both YES and NO tokens.
-        meta = self.registry.get(market_id)
+        meta = self.registry.get_binary_market(market_id)
         if meta is None:
-            self.log.error("resync skipped: missing market mapping", extra={"market_id": market_id})
+            self.log.error("resync skipped: missing/invalid market mapping", extra={"market_id": market_id})
             self._paused_markets.add(market_id)
             return
 
@@ -138,6 +162,9 @@ class MarketWSClient:
         for snap in snapshots:
             if isinstance(snap, Exception):
                 self.log.error("resync snapshot failed", extra={"market_id": market_id})
+                return
+            if is_book_anomalous(snap.get("bids", []), snap.get("asks", []), bool(snap.get("market_active", True)), True):
+                self.log.error("resync snapshot anomalous", extra={"market_id": market_id})
                 return
             self.book_store.upsert(
                 market_id=market_id,

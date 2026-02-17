@@ -57,6 +57,11 @@ class Backtester:
         )
         self.metrics = Metrics()
         self.risk = RiskManager(cfg.risk)
+        initial_capital = float(cfg.raw.get("backtest", {}).get("initial_capital", 0.0))
+        self.risk.cash = initial_capital
+        self.risk.equity = initial_capital
+        self.risk.peak_equity = initial_capital
+
         self.rate_limiter = RateLimiter(cfg.raw["rate_limits"])
         self.order_manager = OrderManager(cfg.order, SimExecutionAdapter(), self.rate_limiter, self.normalizer, self.rules_provider)
         self.strategy = Strategy(
@@ -69,6 +74,7 @@ class Backtester:
             slippage_model=SlippageModel(),
             rules_provider=self.rules_provider,
         )
+        self._trades: list[float] = []
 
     async def run(self) -> dict:
         await self.persistence.init()
@@ -77,7 +83,6 @@ class Backtester:
         events = await self.persistence.load_events_for_replay()
         replay_speed = float(self.cfg.raw.get("backtest", {}).get("replay_speed", 1.0))
         prev_ts: float | None = None
-        last_equity = 0.0
 
         for e in events:
             cur_ts = float(e["ts"])
@@ -112,30 +117,30 @@ class Backtester:
                     size=float(ne.payload.get("size", 0.0)),
                     ts=ne.recv_ts,
                     client_order_id=str(ne.payload.get("client_order_id", "")) or None,
+                    fee=float(ne.payload.get("fee", 0.0)),
                 )
-                if fill.client_order_id:
-                    self.order_manager.on_fill(fill.client_order_id, fill.size)
-                self.risk.on_fill(fill)
-                fee = await self.rules_provider.get_fee_rate(fill.market_id, fill.token_id)
-                self.risk.on_pnl(-(fill.price * fill.size * fee), ne.recv_ts)
+                self._apply_fill(fill)
             elif ne.event_type == EventType.REJECT:
                 self.metrics.inc("reject")
             elif ne.event_type == EventType.CANCEL:
                 self.metrics.inc("cancel")
 
-            mtm = self._mark_to_market()
-            pnl_delta = mtm - last_equity
-            last_equity = mtm
-            self.risk.on_pnl(pnl_delta, ne.recv_ts)
+            self._mark_to_market()
             pnl_curve.append({"ts": float(ne.recv_ts), "equity": float(self.risk.equity)})
 
+        wins = sum(1 for t in self._trades if t > 0)
         report = {
             "metrics": self.metrics.summary(),
             "orders_total": len(self.order_manager.orders_by_client_id),
             "open_orders": self.order_manager.live_open_orders_count(),
-            "equity": self.risk.equity,
+            "final_equity": self.risk.equity,
+            "max_drawdown": self.risk.snapshot().drawdown,
+            "win_rate": (wins / len(self._trades)) if self._trades else 0.0,
+            "trade_count": len(self._trades),
+            "realized_pnl": self.risk.realized_pnl,
+            "unrealized_pnl": self.risk.unrealized_pnl,
+            "cash": self.risk.cash,
             "pnl_curve": pnl_curve[-1000:],
-            "slippage_stats": {"model": "depth_based_v1"},
             "partial_fill_frequency": float(self.metrics.counters.get("partial_fill", 0)),
             "reject_reasons": {"reject_count": float(self.metrics.counters.get("reject", 0))},
             "fill_ratio": float(self.metrics.ratio("fill", "sent")),
@@ -149,7 +154,7 @@ class Backtester:
         return report
 
     async def _run_cycle(self, market_id: str) -> None:
-        meta = self.registry.get(market_id)
+        meta = self.registry.get_binary_market(market_id)
         if meta is None:
             return
 
@@ -173,6 +178,7 @@ class Backtester:
                 self.order_manager.on_ack(order.client_order_id, order.venue_order_id)
                 filled, partial = self._simulate_fill(order.market_id, order.token_id, order.side, order.price, order.remaining_size)
                 if filled > 0:
+                    fee_rate = await self.rules_provider.get_fee_rate(order.market_id, order.token_id)
                     fill = FillRecord(
                         market_id=order.market_id,
                         token_id=order.token_id,
@@ -181,11 +187,10 @@ class Backtester:
                         size=filled,
                         ts=time.time(),
                         client_order_id=order.client_order_id,
+                        fee=order.price * filled * fee_rate,
                     )
                     self.order_manager.on_fill(order.client_order_id, filled)
-                    self.risk.on_fill(fill)
-                    fee = await self.rules_provider.get_fee_rate(order.market_id, order.token_id)
-                    self.risk.on_pnl(-(order.price * filled * fee), fill.ts)
+                    self._apply_fill(fill)
                     self.metrics.inc("fill")
                     if partial:
                         self.metrics.inc("partial_fill")
@@ -230,9 +235,15 @@ class Backtester:
         fill_size = min(size, top_size if top_size > 0 else size)
         return fill_size, fill_size < size
 
+    def _apply_fill(self, fill: FillRecord) -> None:
+        prev_realized = self.risk.realized_pnl
+        self.risk.on_fill(fill)
+        if self.risk.realized_pnl != prev_realized:
+            self._trades.append(self.risk.realized_pnl - prev_realized)
+
     def _mark_to_market(self) -> float:
-        total = 0.0
-        for pos in self.risk.positions.values():
+        price_by_position: dict[str, float] = {}
+        for key, pos in self.risk.positions.items():
             book = self.book_store.get(pos.market_id, pos.token_id)
             if book is None:
                 continue
@@ -240,6 +251,5 @@ class Backtester:
             ask = book.best_ask()
             if bid is None or ask is None:
                 continue
-            mid = (bid + ask) / 2.0
-            total += pos.qty * (mid - pos.avg_price)
-        return total
+            price_by_position[key] = (bid + ask) / 2.0
+        return self.risk.mark_to_market(price_by_position)

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+
+YES_LABELS = {"yes", "y", "true"}
+NO_LABELS = {"no", "n", "false"}
 
 
 @dataclass(slots=True)
@@ -15,6 +19,8 @@ class MarketMeta:
     tick_size: float
     min_order_size: float
     fee_rate: float
+    is_binary_yes_no: bool = True
+    validation_error: str | None = None
 
 
 class MarketRegistry:
@@ -22,8 +28,14 @@ class MarketRegistry:
         self._markets = markets
         self._token_to_market: dict[str, str] = {}
         for market_id, meta in markets.items():
-            self._token_to_market[meta.yes_token_id] = market_id
-            self._token_to_market[meta.no_token_id] = market_id
+            if meta.yes_token_id:
+                self._token_to_market[meta.yes_token_id] = market_id
+            if meta.no_token_id:
+                self._token_to_market[meta.no_token_id] = market_id
+
+    @staticmethod
+    def _normalize_label(label: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", label.strip().lower())
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], market_ids: list[str]) -> "MarketRegistry":
@@ -32,11 +44,20 @@ class MarketRegistry:
         for market_id in market_ids:
             details = raw.get(market_id)
             if not details:
+                markets[market_id] = MarketMeta(
+                    market_id=market_id,
+                    yes_token_id="",
+                    no_token_id="",
+                    tick_size=0.001,
+                    min_order_size=1.0,
+                    fee_rate=0.002,
+                    is_binary_yes_no=False,
+                    validation_error="missing static metadata",
+                )
                 continue
-            yes = str(details.get("yes_token_id", ""))
-            no = str(details.get("no_token_id", ""))
-            if not yes or not no:
-                continue
+            yes = str(details.get("yes_token_id", "")).strip()
+            no = str(details.get("no_token_id", "")).strip()
+            valid = bool(yes and no)
             markets[market_id] = MarketMeta(
                 market_id=market_id,
                 yes_token_id=yes,
@@ -44,6 +65,8 @@ class MarketRegistry:
                 tick_size=float(details.get("tick_size", 0.001)),
                 min_order_size=float(details.get("min_order_size", 1.0)),
                 fee_rate=float(details.get("fee_rate", 0.002)),
+                is_binary_yes_no=valid,
+                validation_error=None if valid else "missing yes/no token ids",
             )
         return cls(markets)
 
@@ -57,8 +80,10 @@ class MarketRegistry:
                     meta = await self._fetch_market_meta(session, gamma_url, market_id)
                     if meta:
                         self._markets[market_id] = meta
-                        self._token_to_market[meta.yes_token_id] = market_id
-                        self._token_to_market[meta.no_token_id] = market_id
+                        if meta.yes_token_id:
+                            self._token_to_market[meta.yes_token_id] = market_id
+                        if meta.no_token_id:
+                            self._token_to_market[meta.no_token_id] = market_id
                 except Exception:
                     logging.getLogger("MarketRegistry").exception("gamma refresh failed", extra={"market_id": market_id})
 
@@ -88,39 +113,88 @@ class MarketRegistry:
         if isinstance(token_ids, str):
             parts = [x.strip() for x in token_ids.split(",") if x.strip()]
         elif isinstance(token_ids, list):
-            parts = [str(x) for x in token_ids]
+            parts = [str(x).strip() for x in token_ids if str(x).strip()]
         else:
             parts = []
-        if len(parts) < 2:
-            return None
 
-        outcomes = data.get("outcomes")
-        yes_idx, no_idx = 0, 1
-        if isinstance(outcomes, list) and len(outcomes) >= 2:
-            out = [str(x).lower() for x in outcomes]
-            if "yes" in out and "no" in out:
-                yes_idx = out.index("yes")
-                no_idx = out.index("no")
+        outcomes = data.get("outcomes") or data.get("outcomePrices") or []
+        labels = [self._normalize_label(str(x)) for x in outcomes] if isinstance(outcomes, list) else []
 
-        yes = parts[yes_idx]
-        no = parts[no_idx]
+        tick = float(data.get("tickSize") or data.get("tick_size") or 0.001)
+        min_size = float(data.get("minOrderSize") or data.get("min_order_size") or 1.0)
+        fee = float(data.get("feeRate") or data.get("fee_rate") or 0.002)
+
+        if len(parts) != 2:
+            return MarketMeta(
+                market_id=market_id,
+                yes_token_id="",
+                no_token_id="",
+                tick_size=tick,
+                min_order_size=min_size,
+                fee_rate=fee,
+                is_binary_yes_no=False,
+                validation_error=f"expected 2 token ids, got {len(parts)}",
+            )
+        if len(labels) != 2:
+            return MarketMeta(
+                market_id=market_id,
+                yes_token_id="",
+                no_token_id="",
+                tick_size=tick,
+                min_order_size=min_size,
+                fee_rate=fee,
+                is_binary_yes_no=False,
+                validation_error=f"expected 2 outcomes, got {len(labels)}",
+            )
+
+        yes_idx = no_idx = -1
+        for i, label in enumerate(labels):
+            if label in YES_LABELS and yes_idx < 0:
+                yes_idx = i
+            if label in NO_LABELS and no_idx < 0:
+                no_idx = i
+
+        if yes_idx < 0 or no_idx < 0 or yes_idx == no_idx:
+            return MarketMeta(
+                market_id=market_id,
+                yes_token_id="",
+                no_token_id="",
+                tick_size=tick,
+                min_order_size=min_size,
+                fee_rate=fee,
+                is_binary_yes_no=False,
+                validation_error=f"ambiguous yes/no outcomes: {labels}",
+            )
+
         return MarketMeta(
             market_id=market_id,
-            yes_token_id=yes,
-            no_token_id=no,
-            tick_size=float(data.get("tickSize") or data.get("tick_size") or 0.001),
-            min_order_size=float(data.get("minOrderSize") or data.get("min_order_size") or 1.0),
-            fee_rate=float(data.get("feeRate") or data.get("fee_rate") or 0.002),
+            yes_token_id=parts[yes_idx],
+            no_token_id=parts[no_idx],
+            tick_size=tick,
+            min_order_size=min_size,
+            fee_rate=fee,
+            is_binary_yes_no=True,
+            validation_error=None,
         )
 
     def get(self, market_id: str) -> MarketMeta | None:
         return self._markets.get(market_id)
 
+    def get_binary_market(self, market_id: str) -> MarketMeta | None:
+        meta = self._markets.get(market_id)
+        if meta is None:
+            return None
+        if not meta.is_binary_yes_no:
+            return None
+        if not meta.yes_token_id or not meta.no_token_id:
+            return None
+        return meta
+
     def get_market_id_by_token(self, token_id: str) -> str | None:
         return self._token_to_market.get(token_id)
 
     def enabled_market_ids(self) -> set[str]:
-        return set(self._markets)
+        return set(mid for mid, meta in self._markets.items() if meta.is_binary_yes_no)
 
     def disable(self, market_id: str) -> None:
         meta = self._markets.pop(market_id, None)

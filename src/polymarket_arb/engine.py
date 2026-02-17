@@ -96,7 +96,7 @@ class TradingEngine:
     async def start(self) -> None:
         await self.persistence.init()
         await self.registry.refresh_from_gamma(self.cfg.gamma_url, self.cfg.markets)
-        self._validate_registry()
+        await self._validate_registry()
 
         self.command_bus.subscribe(self._on_command)
         self.risk.state = EngineState.PAUSED if self.cfg.runtime.start_paused else EngineState.RUNNING
@@ -126,11 +126,23 @@ class TradingEngine:
                 task.cancel()
         await self.persistence.stop(self.cfg.persistence.flush_timeout_sec)
 
-    def _validate_registry(self) -> None:
+    async def _validate_registry(self) -> None:
         for market_id in list(self.enabled_markets):
-            if self.registry.get(market_id) is None:
+            meta = self.registry.get(market_id)
+            if meta is None:
                 self.enabled_markets.discard(market_id)
                 self.log.error("market disabled: missing yes/no token mapping", extra={"market_id": market_id})
+                await self.persistence.record_error("market_registry", "missing_mapping", "market disabled due to missing mapping", {"market_id": market_id})
+                continue
+            if not meta.is_binary_yes_no:
+                self.enabled_markets.discard(market_id)
+                self.log.warning("market disabled: invalid binary yes/no mapping", extra={"market_id": market_id})
+                await self.persistence.record_error(
+                    "market_registry",
+                    "invalid_mapping",
+                    meta.validation_error or "invalid market mapping",
+                    {"market_id": market_id},
+                )
 
     async def _on_command(self, cmd: Command) -> None:
         if cmd.type == CommandType.PAUSE:
@@ -147,7 +159,7 @@ class TradingEngine:
             self.risk.transition(EngineState.SAFE)
         elif cmd.type == CommandType.MARKETS_ON:
             self.enabled_markets.update(set(cmd.payload.get("markets", [])))
-            self._validate_registry()
+            await self._validate_registry()
         elif cmd.type == CommandType.MARKETS_OFF:
             self.enabled_markets -= set(cmd.payload.get("markets", []))
         elif cmd.type == CommandType.RELOAD_CONFIG:
@@ -240,10 +252,11 @@ class TradingEngine:
                 await self._run_decision_cycle(event.market_id, recv_ts)
 
     async def _run_decision_cycle(self, market_id: str, recv_ts: float) -> None:
-        meta = self.registry.get(market_id)
+        meta = self.registry.get_binary_market(market_id)
         if meta is None:
             self.enabled_markets.discard(market_id)
             self.log.error("market disabled: registry missing", extra={"market_id": market_id})
+            await self.persistence.record_error("market_registry", "invalid_mapping", "market disabled in decision cycle", {"market_id": market_id})
             return
 
         book_yes = self.book_store.get(market_id, meta.yes_token_id)
@@ -325,7 +338,7 @@ class TradingEngine:
             if should_trip and self.risk.state == EngineState.RUNNING:
                 self.log.error("kill switch triggered", extra={"event_type": "kill_switch", "correlation_id": reason})
                 self.risk.transition(EngineState.FLATTENING)
-                await self._cancel_all(risk_breach=True)
+                await self._flatten_all()
                 self.risk.transition(EngineState.SAFE)
 
     async def _shed_load(self) -> None:

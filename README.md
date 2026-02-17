@@ -21,7 +21,7 @@ Deterministic asyncio bot scaffold for Polymarket CLOB inefficiency capture:
 - Quantized semantic dedupe in `OrderManager` (ticks/size units).
 - Backpressure handling for event queue and DB queue.
 - Log redaction for API keys, passphrases, secrets, private keys.
-- Backtest updates positions and produces non-flat PnL when fills occur.
+- Backtest accounting with `cash + unrealized` equity model.
 
 ## Setup
 
@@ -77,10 +77,18 @@ python -m polymarket_arb --config config.yaml --mode backtest
 
 Backtest output includes:
 
+- `final_equity`, `max_drawdown`, `win_rate`, `trade_count`
+- `cash`, `realized_pnl`, `unrealized_pnl`
 - equity curve
 - fill/cancel/reject ratios
 - partial fill frequency
 - edge predicted vs realized
+
+Backtest accounting model:
+
+- fills update `cash` (including fees)
+- open positions are marked to market into `unrealized_pnl`
+- `equity = cash + unrealized_pnl`
 
 ## Flatten Mode
 
@@ -92,6 +100,10 @@ Set in `config.yaml`:
 `cancel_only`: cancels open orders only.
 
 `cancel_and_unwind`: cancels open orders then attempts inventory unwind subject to slippage/rate limits.
+
+Kill-switch behavior uses flatten mode too:
+
+- circuit breaker trigger -> `FLATTENING` -> run configured flatten path -> `SAFE`
 
 ## Dry Run
 
@@ -107,5 +119,14 @@ This runs live market/user WS + full decision path without real order placement.
 ## Tests
 
 ```bash
-PYTHONPATH=src pytest -q
+pytest -q
 ```
+
+## Safety Checklist Before Live Trading
+
+1. Keep `DRY_RUN=true` and `START_PAUSED=true` for first startup.
+2. Verify enabled markets have valid binary yes/no mapping.
+3. Verify websocket connection and periodic resync logs.
+4. Confirm log redaction is active (no API secrets/private key in logs).
+5. Run `pytest -q` on the deployment artifact.
+6. Manually verify `pause`, `resume`, and `flatten` behavior before enabling live.

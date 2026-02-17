@@ -46,11 +46,7 @@ def test_positions_and_pnl_change_after_fill(tmp_path):
     )
     bt = Backtester(cfg, registry)
     bt.book_store.upsert("m1", "z_yes", [{"price": 0.6, "size": 10}], [{"price": 0.62, "size": 10}], time.time(), None, active=True, require_nonempty_if_active=False)
-
-    fill = FillRecord("m1", "z_yes", "buy", 0.5, 1.0, time.time())
-    bt.risk.on_fill(fill)
-    mtm = bt._mark_to_market()
-    bt.risk.on_pnl(mtm)
-
+    bt._apply_fill(FillRecord("m1", "z_yes", "buy", 0.5, 1.0, time.time(), fee=0.0))
+    bt._mark_to_market()
     assert bt.risk.positions["m1:z_yes"].qty == 1.0
     assert bt.risk.equity > 0.0

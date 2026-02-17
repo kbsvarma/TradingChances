@@ -18,6 +18,9 @@ class RiskSnapshot:
     drawdown: float
     ws_healthy: bool
     picked_off_spike: bool
+    cash: float
+    realized_pnl: float
+    unrealized_pnl: float
 
 
 @dataclass(slots=True)
@@ -32,6 +35,10 @@ class RiskManager:
     latencies_ms: deque[float] = field(default_factory=deque)
     picked_off_events: deque[tuple[float, int]] = field(default_factory=deque)
     ws_last_seen_ts: float = 0.0
+
+    cash: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
     peak_equity: float = 0.0
     equity: float = 0.0
 
@@ -64,14 +71,60 @@ class RiskManager:
     def on_fill(self, fill: FillRecord) -> None:
         key = f"{fill.market_id}:{fill.token_id}"
         pos = self.positions.setdefault(key, Position(fill.market_id, fill.token_id))
-        sign = 1 if fill.side == "buy" else -1
-        old_qty = pos.qty
-        new_qty = old_qty + (sign * fill.size)
-        if new_qty != 0:
-            pos.avg_price = ((pos.avg_price * old_qty) + (fill.price * sign * fill.size)) / new_qty
+
+        side_sign = 1.0 if fill.side == "buy" else -1.0
+        qty_delta = side_sign * float(fill.size)
+        old_qty = float(pos.qty)
+        new_qty = old_qty + qty_delta
+        fill_price = float(fill.price)
+
+        fee = float(fill.fee)
+        notional = fill_price * float(fill.size)
+        if fill.side == "buy":
+            self.cash -= (notional + fee)
         else:
+            self.cash += (notional - fee)
+
+        if old_qty == 0.0:
+            pos.qty = new_qty
+            pos.avg_price = fill_price if new_qty != 0 else 0.0
+            self._sync_equity()
+            return
+
+        old_sign = 1.0 if old_qty > 0 else -1.0
+        delta_sign = 1.0 if qty_delta > 0 else -1.0
+
+        # Same-side increase: weighted average.
+        if old_sign == delta_sign:
+            abs_old = abs(old_qty)
+            abs_add = abs(qty_delta)
+            pos.qty = new_qty
+            if abs_old + abs_add > 0:
+                pos.avg_price = ((pos.avg_price * abs_old) + (fill_price * abs_add)) / (abs_old + abs_add)
+            self._sync_equity()
+            return
+
+        # Opposite-side trade: reduce or flip.
+        closing_qty = min(abs(old_qty), abs(qty_delta))
+        if old_qty > 0:  # reducing long via sell
+            realized = (fill_price - pos.avg_price) * closing_qty
+        else:  # reducing short via buy
+            realized = (pos.avg_price - fill_price) * closing_qty
+        self.realized_pnl += realized
+
+        if abs(qty_delta) < abs(old_qty):
+            # Partial reduction: keep basis.
+            pos.qty = new_qty
+        elif abs(qty_delta) == abs(old_qty):
+            # Flat.
+            pos.qty = 0.0
             pos.avg_price = 0.0
-        pos.qty = new_qty
+        else:
+            # Flip: reset basis to fill price on new side.
+            pos.qty = new_qty
+            pos.avg_price = fill_price
+
+        self._sync_equity()
 
     def on_pnl(self, pnl_delta: float, ts: float | None = None) -> None:
         ts = ts or time.time()
@@ -81,6 +134,18 @@ class RiskManager:
         self.pnl_day_events.append((ts, pnl_delta))
         self._trim(self.pnl_hour_events, 3600)
         self._trim(self.pnl_day_events, 86400)
+
+    def mark_to_market(self, price_by_position: dict[str, float]) -> float:
+        unrealized = 0.0
+        for key, pos in self.positions.items():
+            px = price_by_position.get(key)
+            if px is None:
+                continue
+            unrealized += pos.qty * (px - pos.avg_price)
+        self.unrealized_pnl = unrealized
+        self.equity = self.cash + self.unrealized_pnl
+        self.peak_equity = max(self.peak_equity, self.equity)
+        return self.equity
 
     def set_open_orders(self, market_id: str, value: int) -> None:
         self.open_orders_per_market[market_id] = value
@@ -161,7 +226,14 @@ class RiskManager:
             drawdown=self.peak_equity - self.equity,
             ws_healthy=ws_healthy,
             picked_off_spike=picked_off_spike,
+            cash=self.cash,
+            realized_pnl=self.realized_pnl,
+            unrealized_pnl=self.unrealized_pnl,
         )
+
+    def _sync_equity(self) -> None:
+        self.equity = self.cash + self.unrealized_pnl
+        self.peak_equity = max(self.peak_equity, self.equity)
 
     def _exposure(self) -> float:
         return sum(abs(pos.qty * pos.avg_price) for pos in self.positions.values())

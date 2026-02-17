@@ -146,3 +146,4 @@ class FillRecord:
     ts: float
     order_id: str | None = None
     client_order_id: str | None = None
+    fee: float = 0.0
