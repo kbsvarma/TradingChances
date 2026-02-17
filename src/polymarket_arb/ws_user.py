@@ -16,11 +16,19 @@ from polymarket_arb.wss_auth import build_user_subscribe_payload, redact_payload
 class UserWSClient:
     """Private user websocket client (acks/fills/rejects are source of truth)."""
 
-    def __init__(self, ws_url: str, auth: dict[str, str], normalizer, out_queue: asyncio.Queue[NormalizedEvent]) -> None:
+    def __init__(
+        self,
+        ws_url: str,
+        auth: dict[str, str],
+        normalizer,
+        out_queue: asyncio.Queue[NormalizedEvent],
+        on_user_event=None,
+    ) -> None:
         self.ws_url = ws_url
         self.auth = auth
         self.normalizer = normalizer
         self.out_queue = out_queue
+        self.on_user_event = on_user_event
         self.log = logging.getLogger("UserWSClient")
         self._stop = asyncio.Event()
 
@@ -41,6 +49,8 @@ class UserWSClient:
                         msg = json.loads(raw)
                         event = self.normalizer.from_user_ws(msg)
                         if event is not None:
+                            if self.on_user_event is not None:
+                                self.on_user_event()
                             await self.out_queue.put(event)
                         if self._stop.is_set():
                             break

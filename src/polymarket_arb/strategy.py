@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from polymarket_arb.market_rules import MarketRulesProvider
 from polymarket_arb.types import BookState, Intent, IntentType, Position
@@ -39,10 +40,17 @@ class SlippageModel:
 class Strategy:
     """Deterministic strategy: no randomness, no LLM."""
 
-    def __init__(self, params: StrategyParams, slippage_model: SlippageModel, rules_provider: MarketRulesProvider) -> None:
+    def __init__(
+        self,
+        params: StrategyParams,
+        slippage_model: SlippageModel,
+        rules_provider: MarketRulesProvider,
+        slippage_buffer_provider: Callable[[str], float] | None = None,
+    ) -> None:
         self.params = params
         self.slippage_model = slippage_model
         self.rules_provider = rules_provider
+        self.slippage_buffer_provider = slippage_buffer_provider
 
     async def compute_intents(
         self,
@@ -69,7 +77,11 @@ class Strategy:
         slip_no = self.slippage_model.estimate(book_no, "buy", size)
         slippage = slip_yes + slip_no
 
-        executable_edge = 1 - (best_yes + best_no) - fee_rate - slippage - self.params.failure_buffer
+        adaptive_buffer = self.params.failure_buffer
+        if self.slippage_buffer_provider is not None:
+            adaptive_buffer = max(adaptive_buffer, float(self.slippage_buffer_provider(market_id)))
+
+        executable_edge = 1 - (best_yes + best_no) - fee_rate - slippage - adaptive_buffer
         if executable_edge <= self.params.min_edge_threshold:
             return [Intent(IntentType.NOOP, market_id, token_yes, reason="edge_below_threshold")]
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import asdict
 
@@ -10,6 +11,7 @@ from polymarket_arb.book import BookStore
 from polymarket_arb.command_bus import CommandBus
 from polymarket_arb.config import BotConfig, load_config, required_env
 from polymarket_arb.control import CLICommandAPI
+from polymarket_arb.edge_quality import EdgeQualityGuard
 from polymarket_arb.execution import ExecutionAdapter
 from polymarket_arb.market_registry import MarketRegistry
 from polymarket_arb.market_rules import MarketRulesProvider
@@ -19,6 +21,8 @@ from polymarket_arb.order_manager import OrderManager
 from polymarket_arb.persistence import Persistence
 from polymarket_arb.rate_limiter import RateLimiter
 from polymarket_arb.risk import RiskManager
+from polymarket_arb.safety_watchdog import UserWSWatchdog
+from polymarket_arb.slippage_monitor import SlippageMonitor
 from polymarket_arb.strategy import SlippageModel, Strategy, StrategyParams
 from polymarket_arb.types import Command, CommandType, EngineState, EventType, FillRecord, Intent, IntentType, NormalizedEvent
 from polymarket_arb.ws_market import MarketWSClient
@@ -51,6 +55,20 @@ class TradingEngine:
             cfg.persistence.buffer_maxsize,
             cfg.persistence.buffer_high_watermark,
         )
+        self.user_ws_watchdog = UserWSWatchdog(timeout_sec=cfg.safety.user_ws_timeout_sec)
+        self.last_user_event_ts = self.user_ws_watchdog.last_event_ts
+        self.user_ws_timeout_sec = float(cfg.safety.user_ws_timeout_sec)
+        self.edge_quality = EdgeQualityGuard(
+            window_size=cfg.safety.edge_decay_window_size,
+            min_ratio=cfg.safety.edge_decay_min_ratio,
+            min_trades=cfg.safety.edge_decay_min_trades,
+        )
+        self.slippage_monitor = SlippageMonitor(
+            multiplier=cfg.safety.slippage_multiplier,
+            window_size=cfg.safety.slippage_window_size,
+            baseline_buffer=cfg.thresholds.failure_buffer,
+        )
+        self.predicted_edge_by_client_id: dict[str, float] = {}
 
         self.strategy = Strategy(
             params=StrategyParams(
@@ -61,6 +79,7 @@ class TradingEngine:
             ),
             slippage_model=SlippageModel(),
             rules_provider=self.rules_provider,
+            slippage_buffer_provider=self.slippage_monitor.adaptive_buffer,
         )
         self.risk = RiskManager(cfg.risk)
         self.rate_limiter = RateLimiter(cfg.raw["rate_limits"])
@@ -89,6 +108,7 @@ class TradingEngine:
             },
             normalizer=self.normalizer,
             out_queue=self.event_q,
+            on_user_event=self.notify_user_event,
         )
 
         self._tasks: list[asyncio.Task] = []
@@ -166,6 +186,13 @@ class TradingEngine:
             self.enabled_markets -= set(cmd.payload.get("markets", []))
         elif cmd.type == CommandType.RELOAD_CONFIG:
             self.cfg = load_config()
+            self.user_ws_watchdog.timeout_sec = float(self.cfg.safety.user_ws_timeout_sec)
+            self.user_ws_timeout_sec = float(self.cfg.safety.user_ws_timeout_sec)
+            self.slippage_monitor.multiplier = float(self.cfg.safety.slippage_multiplier)
+            self.slippage_monitor.window_size = int(self.cfg.safety.slippage_window_size)
+            self.edge_quality.min_ratio = float(self.cfg.safety.edge_decay_min_ratio)
+            self.edge_quality.min_trades = int(self.cfg.safety.edge_decay_min_trades)
+            self.edge_quality.window_size = int(self.cfg.safety.edge_decay_window_size)
             self.log.info("config reloaded")
         elif cmd.type == CommandType.SET_PARAMS:
             self._apply_params(cmd.payload)
@@ -204,6 +231,7 @@ class TradingEngine:
                 continue
 
             if event.event_type == EventType.ORDER_ACK:
+                self.notify_user_event()
                 client_order_id = str(event.payload.get("client_order_id", ""))
                 venue_order_id = event.payload.get("order_id")
                 if client_order_id:
@@ -214,21 +242,28 @@ class TradingEngine:
                 continue
 
             if event.event_type == EventType.REJECT:
+                self.notify_user_event()
                 client_order_id = str(event.payload.get("client_order_id", ""))
                 if client_order_id:
                     self.order_manager.on_reject(client_order_id)
+                    self.slippage_monitor.clear_expected(client_order_id)
+                    self.predicted_edge_by_client_id.pop(client_order_id, None)
                 self.risk.on_reject(recv_ts)
                 self.metrics.inc("reject")
                 continue
 
             if event.event_type == EventType.CANCEL:
+                self.notify_user_event()
                 client_order_id = str(event.payload.get("client_order_id", ""))
                 if client_order_id:
                     self.order_manager.on_cancel(client_order_id)
+                    self.slippage_monitor.clear_expected(client_order_id)
+                    self.predicted_edge_by_client_id.pop(client_order_id, None)
                 self.metrics.inc("cancel")
                 continue
 
             if event.event_type == EventType.FILL:
+                self.notify_user_event()
                 fill = FillRecord(
                     market_id=event.market_id,
                     token_id=str(event.token_id or ""),
@@ -241,10 +276,16 @@ class TradingEngine:
                 )
                 if fill.client_order_id:
                     self.order_manager.on_fill(fill.client_order_id, fill.size)
+                    self.slippage_monitor.record_fill(fill.client_order_id, fill.price)
                     order = self.order_manager.orders_by_client_id.get(fill.client_order_id)
                     if order and order.ack_ts is not None and order.first_fill_ts is not None:
                         self.metrics.observe_latency("ack_to_fill", (order.first_fill_ts - order.ack_ts) * 1000)
+                    if order and order.status.value in {"FILLED", "CLOSED", "CANCELED", "REJECTED", "EXPIRED"}:
+                        self.slippage_monitor.clear_expected(fill.client_order_id)
+                realized_before = self.risk.realized_pnl
                 self.risk.on_fill(fill)
+                realized_delta = self.risk.realized_pnl - realized_before
+                self._update_edge_quality(fill, realized_delta)
                 self.metrics.inc("fill")
                 self._handle_picked_off(fill)
                 await self.persistence.record_fill(asdict(fill))
@@ -304,6 +345,12 @@ class TradingEngine:
                 self.metrics.inc("dropped")
 
             if decision.client_order_id:
+                if decision.accepted and intent.intent_type == IntentType.PLACE:
+                    predicted = self._extract_predicted_edge(intent.reason)
+                    if predicted is not None:
+                        self.predicted_edge_by_client_id[decision.client_order_id] = predicted
+                    if intent.price is not None:
+                        self.slippage_monitor.record_expected(decision.client_order_id, intent.market_id, float(intent.price))
                 order = self.order_manager.orders_by_client_id.get(decision.client_order_id)
                 if order:
                     await self.persistence.upsert_order(
@@ -345,6 +392,14 @@ class TradingEngine:
                 self.risk.transition(EngineState.FLATTENING)
                 await self._flatten_all()
                 self.risk.transition(EngineState.SAFE)
+                continue
+
+            if self.risk.state == EngineState.RUNNING and self.user_ws_watchdog.is_timed_out():
+                self.log.error("User WS heartbeat timeout", extra={"event_type": "user_ws_timeout", "correlation_id": "user_ws_watchdog"})
+                self.risk.transition(EngineState.FLATTENING)
+                await self._flatten_all()
+                self.risk.transition(EngineState.SAFE)
+                await self.persistence.record_error("user_ws", "timeout", "User WS heartbeat timeout", {"timeout_sec": self.user_ws_watchdog.timeout_sec})
 
     async def _shed_load(self) -> None:
         keep: list[NormalizedEvent] = []
@@ -467,3 +522,53 @@ class TradingEngine:
         if not self.picked_off.is_picked_off(fill.price, post_fill_best, fill.side):
             return
         self.risk.on_picked_off(fill.ts)
+
+    def notify_user_event(self) -> None:
+        self.user_ws_watchdog.touch()
+        self.last_user_event_ts = self.user_ws_watchdog.last_event_ts
+
+    @staticmethod
+    def _extract_predicted_edge(reason: str) -> float | None:
+        m = re.search(r"edge=([-+]?[0-9]*\.?[0-9]+)", reason or "")
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+
+    def _update_edge_quality(self, fill: FillRecord, realized_pnl_delta: float) -> None:
+        if not fill.client_order_id:
+            return
+        predicted = self.predicted_edge_by_client_id.get(fill.client_order_id)
+        if predicted is None:
+            return
+        notional = abs(float(fill.price) * float(fill.size))
+        if notional <= 0:
+            return
+        realized_edge = realized_pnl_delta / notional
+        self.edge_quality.record(fill.market_id, predicted, realized_edge)
+        if self.edge_quality.should_disable(fill.market_id):
+            if fill.market_id in self.enabled_markets:
+                self.enabled_markets.discard(fill.market_id)
+                ratio = self.edge_quality.quality_ratio(fill.market_id)
+                self.log.warning(
+                    "market auto-disabled due to edge decay",
+                    extra={
+                        "event_type": "edge_decay_disable",
+                        "market_id": fill.market_id,
+                        "quality_ratio": ratio,
+                    },
+                )
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(
+                        self.persistence.record_error(
+                            "edge_quality",
+                            "edge_decay_disable",
+                            "market auto-disabled due to poor realized edge",
+                            {"market_id": fill.market_id, "quality_ratio": ratio},
+                        )
+                    )
+                except RuntimeError:
+                    pass

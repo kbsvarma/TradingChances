@@ -24,6 +24,9 @@ Deterministic asyncio bot scaffold for Polymarket CLOB inefficiency capture:
 - Backtest accounting with `cash + unrealized` equity model.
 - Realized fill deltas feed hourly/daily loss breakers.
 - FLATTENING invariant: no new quoting/arb orders are emitted.
+- User WS watchdog pauses/flat-flags if private stream goes silent.
+- Edge decay guard auto-disables markets with poor realized-vs-predicted edge.
+- Adaptive slippage buffer expands from recent live fill slippage.
 
 ## Setup
 
@@ -115,6 +118,50 @@ Kill-switch behavior uses flatten mode too:
 - `markets.allow_nonstandard_yes_no_labels: false` (default, strict)
 - if `true`, registry also accepts nonstandard binary labels like `true/false` or `y/n`
 
+## User WS Watchdog
+
+Config (`config.yaml`):
+
+- `safety.user_ws_timeout_sec: 15`
+
+Behavior:
+
+- each private user event (ack/fill/cancel/reject) refreshes watchdog heartbeat
+- if no user events for timeout window while running:
+  - transition `RUNNING -> FLATTENING -> SAFE`
+  - execute configured flatten mode
+  - emit error alert log/event
+
+To effectively disable for debugging, set a very large timeout value.
+
+## Edge Decay Protection
+
+Config (`config.yaml`):
+
+- `safety.edge_decay_min_ratio: 0.5`
+- `safety.edge_decay_min_trades: 15`
+- `safety.edge_decay_window_size: 30`
+
+Metric:
+
+- quality ratio = `avg_realized_edge / avg_predicted_edge`
+- if ratio below threshold after minimum trade samples, only that market is auto-disabled
+
+## Adaptive Slippage Buffer
+
+Config (`config.yaml`):
+
+- `safety.slippage_multiplier: 1.5`
+- `safety.slippage_window_size: 50`
+
+Behavior:
+
+- live slippage = `abs(fill_price - expected_price_at_intent)`
+- rolling p95 slippage per market feeds dynamic buffer
+- effective buffer used by strategy is:
+  - `max(failure_buffer, rolling_p95 * slippage_multiplier)`
+  - never below configured baseline `failure_buffer`
+
 ## Dry Run
 
 Keep in `.env`:
@@ -141,3 +188,5 @@ pytest -q
 5. Verify hourly/daily loss breakers are configured and monitoring realized fill losses.
 6. Run `pytest -q` on the deployment artifact.
 7. Manually verify `pause`, `resume`, and `flatten` behavior before enabling live.
+8. Verify User WS watchdog triggers SAFE mode when private stream is intentionally paused.
+9. Start with conservative edge/slippage settings, then tighten only after stable live samples.

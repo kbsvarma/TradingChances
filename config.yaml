@@ -80,6 +80,14 @@ snapshot:
   require_nonempty_active_book: true
   max_level_size: null
 
+safety:
+  user_ws_timeout_sec: 15
+  edge_decay_min_ratio: 0.5
+  edge_decay_min_trades: 15
+  edge_decay_window_size: 30
+  slippage_multiplier: 1.5
+  slippage_window_size: 50
+
 gamma:
   gamma_api_url: https://gamma-api.polymarket.com
 

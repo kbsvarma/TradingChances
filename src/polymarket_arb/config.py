@@ -78,6 +78,16 @@ class SnapshotConfig:
 
 
 @dataclass(slots=True)
+class SafetyConfig:
+    user_ws_timeout_sec: int
+    edge_decay_min_ratio: float
+    edge_decay_min_trades: int
+    edge_decay_window_size: int
+    slippage_multiplier: float
+    slippage_window_size: int
+
+
+@dataclass(slots=True)
 class BotConfig:
     runtime: RuntimeConfig
     markets: list[str]
@@ -88,6 +98,7 @@ class BotConfig:
     trading_safety: TradingSafetyConfig
     market_validation: MarketValidationConfig
     snapshot: SnapshotConfig
+    safety: SafetyConfig
     gamma_url: str
     raw: dict[str, Any]
 
@@ -133,6 +144,14 @@ def load_config(config_path: str = "config.yaml") -> BotConfig:
         require_nonempty_active_book=bool(_deep_get(data, "snapshot.require_nonempty_active_book")),
         max_level_size=None if raw_max_level_size is None else float(raw_max_level_size),
     )
+    safety = SafetyConfig(
+        user_ws_timeout_sec=int(_deep_get(data, "safety.user_ws_timeout_sec")),
+        edge_decay_min_ratio=float(_deep_get(data, "safety.edge_decay_min_ratio")),
+        edge_decay_min_trades=int(_deep_get(data, "safety.edge_decay_min_trades")),
+        edge_decay_window_size=int(_deep_get(data, "safety.edge_decay_window_size")),
+        slippage_multiplier=float(_deep_get(data, "safety.slippage_multiplier")),
+        slippage_window_size=int(_deep_get(data, "safety.slippage_window_size")),
+    )
 
     return BotConfig(
         runtime=runtime,
@@ -144,6 +163,7 @@ def load_config(config_path: str = "config.yaml") -> BotConfig:
         trading_safety=trading_safety,
         market_validation=market_validation,
         snapshot=snapshot,
+        safety=safety,
         gamma_url=os.getenv("GAMMA_API_URL", str(_deep_get(data, "gamma.gamma_api_url"))),
         raw=data,
     )
