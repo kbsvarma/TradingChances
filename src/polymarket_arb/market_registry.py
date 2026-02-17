@@ -7,8 +7,10 @@ from typing import Any
 
 import aiohttp
 
-YES_LABELS = {"yes", "y", "true"}
-NO_LABELS = {"no", "n", "false"}
+STRICT_YES_LABELS = {"yes"}
+STRICT_NO_LABELS = {"no"}
+PERMISSIVE_YES_LABELS = {"yes", "y", "true"}
+PERMISSIVE_NO_LABELS = {"no", "n", "false"}
 
 
 @dataclass(slots=True)
@@ -24,8 +26,9 @@ class MarketMeta:
 
 
 class MarketRegistry:
-    def __init__(self, markets: dict[str, MarketMeta]) -> None:
+    def __init__(self, markets: dict[str, MarketMeta], allow_nonstandard_yes_no_labels: bool = False) -> None:
         self._markets = markets
+        self.allow_nonstandard_yes_no_labels = allow_nonstandard_yes_no_labels
         self._token_to_market: dict[str, str] = {}
         for market_id, meta in markets.items():
             if meta.yes_token_id:
@@ -40,6 +43,7 @@ class MarketRegistry:
     @classmethod
     def from_config(cls, cfg: dict[str, Any], market_ids: list[str]) -> "MarketRegistry":
         raw = cfg.get("market_metadata", {})
+        allow_nonstandard = bool(cfg.get("markets", {}).get("allow_nonstandard_yes_no_labels", False))
         markets: dict[str, MarketMeta] = {}
         for market_id in market_ids:
             details = raw.get(market_id)
@@ -68,7 +72,12 @@ class MarketRegistry:
                 is_binary_yes_no=valid,
                 validation_error=None if valid else "missing yes/no token ids",
             )
-        return cls(markets)
+        return cls(markets, allow_nonstandard_yes_no_labels=allow_nonstandard)
+
+    def _label_sets(self) -> tuple[set[str], set[str]]:
+        if self.allow_nonstandard_yes_no_labels:
+            return PERMISSIVE_YES_LABELS, PERMISSIVE_NO_LABELS
+        return STRICT_YES_LABELS, STRICT_NO_LABELS
 
     async def refresh_from_gamma(self, gamma_url: str, market_ids: list[str], timeout_sec: int = 8) -> None:
         if not market_ids:
@@ -147,11 +156,12 @@ class MarketRegistry:
                 validation_error=f"expected 2 outcomes, got {len(labels)}",
             )
 
+        yes_labels, no_labels = self._label_sets()
         yes_idx = no_idx = -1
         for i, label in enumerate(labels):
-            if label in YES_LABELS and yes_idx < 0:
+            if label in yes_labels and yes_idx < 0:
                 yes_idx = i
-            if label in NO_LABELS and no_idx < 0:
+            if label in no_labels and no_idx < 0:
                 no_idx = i
 
         if yes_idx < 0 or no_idx < 0 or yes_idx == no_idx:

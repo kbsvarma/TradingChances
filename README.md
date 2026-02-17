@@ -22,6 +22,8 @@ Deterministic asyncio bot scaffold for Polymarket CLOB inefficiency capture:
 - Backpressure handling for event queue and DB queue.
 - Log redaction for API keys, passphrases, secrets, private keys.
 - Backtest accounting with `cash + unrealized` equity model.
+- Realized fill deltas feed hourly/daily loss breakers.
+- FLATTENING invariant: no new quoting/arb orders are emitted.
 
 ## Setup
 
@@ -104,6 +106,14 @@ Set in `config.yaml`:
 Kill-switch behavior uses flatten mode too:
 
 - circuit breaker trigger -> `FLATTENING` -> run configured flatten path -> `SAFE`
+- while `FLATTENING`, decision cycle skips strategy intents and only flatten workflow is allowed
+
+## Market Label Validation
+
+`config.yaml`:
+
+- `markets.allow_nonstandard_yes_no_labels: false` (default, strict)
+- if `true`, registry also accepts nonstandard binary labels like `true/false` or `y/n`
 
 ## Dry Run
 
@@ -128,5 +138,6 @@ pytest -q
 2. Verify enabled markets have valid binary yes/no mapping.
 3. Verify websocket connection and periodic resync logs.
 4. Confirm log redaction is active (no API secrets/private key in logs).
-5. Run `pytest -q` on the deployment artifact.
-6. Manually verify `pause`, `resume`, and `flatten` behavior before enabling live.
+5. Verify hourly/daily loss breakers are configured and monitoring realized fill losses.
+6. Run `pytest -q` on the deployment artifact.
+7. Manually verify `pause`, `resume`, and `flatten` behavior before enabling live.

@@ -107,10 +107,13 @@ class RiskManager:
         # Opposite-side trade: reduce or flip.
         closing_qty = min(abs(old_qty), abs(qty_delta))
         if old_qty > 0:  # reducing long via sell
-            realized = (fill_price - pos.avg_price) * closing_qty
+            realized_gross = (fill_price - pos.avg_price) * closing_qty
         else:  # reducing short via buy
-            realized = (pos.avg_price - fill_price) * closing_qty
-        self.realized_pnl += realized
+            realized_gross = (pos.avg_price - fill_price) * closing_qty
+        fee_alloc = fee * (closing_qty / float(fill.size)) if float(fill.size) > 0 else 0.0
+        realized_net = realized_gross - fee_alloc
+        self.realized_pnl += realized_net
+        self._append_pnl_event(realized_net, fill.ts or time.time())
 
         if abs(qty_delta) < abs(old_qty):
             # Partial reduction: keep basis.
@@ -130,10 +133,7 @@ class RiskManager:
         ts = ts or time.time()
         self.equity += pnl_delta
         self.peak_equity = max(self.peak_equity, self.equity)
-        self.pnl_hour_events.append((ts, pnl_delta))
-        self.pnl_day_events.append((ts, pnl_delta))
-        self._trim(self.pnl_hour_events, 3600)
-        self._trim(self.pnl_day_events, 86400)
+        self._append_pnl_event(pnl_delta, ts)
 
     def mark_to_market(self, price_by_position: dict[str, float]) -> float:
         unrealized = 0.0
@@ -173,9 +173,9 @@ class RiskManager:
             return False, "max_total_exposure"
 
         snap = self.snapshot()
-        if abs(snap.hourly_pnl) > self.cfg.max_hourly_loss:
+        if snap.hourly_pnl < -self.cfg.max_hourly_loss:
             return False, "max_hourly_loss"
-        if abs(snap.daily_pnl) > self.cfg.max_daily_loss:
+        if snap.daily_pnl < -self.cfg.max_daily_loss:
             return False, "max_daily_loss"
         if snap.reject_rate > self.cfg.reject_rate_limit:
             return False, "reject_rate_limit"
@@ -201,9 +201,9 @@ class RiskManager:
             return True, "picked_off_spike"
         if not snap.ws_healthy:
             return True, "ws_health"
-        if abs(snap.hourly_pnl) > self.cfg.max_hourly_loss:
+        if snap.hourly_pnl < -self.cfg.max_hourly_loss:
             return True, "hourly_loss"
-        if abs(snap.daily_pnl) > self.cfg.max_daily_loss:
+        if snap.daily_pnl < -self.cfg.max_daily_loss:
             return True, "daily_loss"
         return False, "ok"
 
@@ -235,12 +235,18 @@ class RiskManager:
         self.equity = self.cash + self.unrealized_pnl
         self.peak_equity = max(self.peak_equity, self.equity)
 
+    def _append_pnl_event(self, pnl_delta: float, ts: float) -> None:
+        self.pnl_hour_events.append((ts, pnl_delta))
+        self.pnl_day_events.append((ts, pnl_delta))
+        self._trim(self.pnl_hour_events, 3600, now_ts=ts)
+        self._trim(self.pnl_day_events, 86400, now_ts=ts)
+
     def _exposure(self) -> float:
         return sum(abs(pos.qty * pos.avg_price) for pos in self.positions.values())
 
     @staticmethod
-    def _trim(buf: deque[tuple[float, float] | tuple[float, int]], window_sec: int) -> None:
-        now = time.time()
+    def _trim(buf: deque[tuple[float, float] | tuple[float, int]], window_sec: int, now_ts: float | None = None) -> None:
+        now = now_ts if now_ts is not None else time.time()
         while buf and (now - float(buf[0][0])) > window_sec:
             buf.popleft()
 

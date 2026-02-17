@@ -67,6 +67,17 @@ class TradingSafetyConfig:
 
 
 @dataclass(slots=True)
+class MarketValidationConfig:
+    allow_nonstandard_yes_no_labels: bool
+
+
+@dataclass(slots=True)
+class SnapshotConfig:
+    require_nonempty_active_book: bool
+    max_level_size: float | None
+
+
+@dataclass(slots=True)
 class BotConfig:
     runtime: RuntimeConfig
     markets: list[str]
@@ -75,6 +86,8 @@ class BotConfig:
     order: OrderConfig
     persistence: PersistenceConfig
     trading_safety: TradingSafetyConfig
+    market_validation: MarketValidationConfig
+    snapshot: SnapshotConfig
     gamma_url: str
     raw: dict[str, Any]
 
@@ -112,6 +125,14 @@ def load_config(config_path: str = "config.yaml") -> BotConfig:
         flush_timeout_sec=int(_deep_get(data, "persistence.flush_timeout_sec")),
     )
     trading_safety = TradingSafetyConfig(flatten_mode=str(_deep_get(data, "trading_safety.flatten_mode")))
+    market_validation = MarketValidationConfig(
+        allow_nonstandard_yes_no_labels=bool(_deep_get(data, "markets.allow_nonstandard_yes_no_labels"))
+    )
+    raw_max_level_size = _deep_get(data, "snapshot.max_level_size")
+    snapshot = SnapshotConfig(
+        require_nonempty_active_book=bool(_deep_get(data, "snapshot.require_nonempty_active_book")),
+        max_level_size=None if raw_max_level_size is None else float(raw_max_level_size),
+    )
 
     return BotConfig(
         runtime=runtime,
@@ -121,6 +142,8 @@ def load_config(config_path: str = "config.yaml") -> BotConfig:
         order=order,
         persistence=persistence,
         trading_safety=trading_safety,
+        market_validation=market_validation,
+        snapshot=snapshot,
         gamma_url=os.getenv("GAMMA_API_URL", str(_deep_get(data, "gamma.gamma_api_url"))),
         raw=data,
     )

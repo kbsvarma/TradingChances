@@ -77,6 +77,8 @@ class TradingEngine:
             normalizer=self.normalizer,
             out_queue=self.event_q,
             book_store=self.book_store,
+            require_nonempty_active_book=cfg.snapshot.require_nonempty_active_book,
+            snapshot_max_level_size=cfg.snapshot.max_level_size,
         )
         self.user_ws = UserWSClient(
             ws_url=self.env["CLOB_WS_URL"],
@@ -252,6 +254,9 @@ class TradingEngine:
                 await self._run_decision_cycle(event.market_id, recv_ts)
 
     async def _run_decision_cycle(self, market_id: str, recv_ts: float) -> None:
+        if self.risk.state == EngineState.FLATTENING:
+            return
+
         meta = self.registry.get_binary_market(market_id)
         if meta is None:
             self.enabled_markets.discard(market_id)

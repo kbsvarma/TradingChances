@@ -7,6 +7,7 @@ runtime:
   event_queue_high_watermark: 30000
 
 markets:
+  allow_nonstandard_yes_no_labels: false
   enabled:
     - market_1
     - market_2
@@ -74,6 +75,10 @@ control:
 
 trading_safety:
   flatten_mode: cancel_only
+
+snapshot:
+  require_nonempty_active_book: true
+  max_level_size: null
 
 gamma:
   gamma_api_url: https://gamma-api.polymarket.com

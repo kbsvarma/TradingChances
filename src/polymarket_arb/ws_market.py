@@ -54,6 +54,8 @@ class MarketWSClient:
         normalizer,
         out_queue: asyncio.Queue[NormalizedEvent],
         book_store: BookStore,
+        require_nonempty_active_book: bool = True,
+        snapshot_max_level_size: float | None = None,
     ) -> None:
         self.ws_url = ws_url
         self.rest_url = rest_url
@@ -62,6 +64,8 @@ class MarketWSClient:
         self.normalizer = normalizer
         self.out_queue = out_queue
         self.book_store = book_store
+        self.require_nonempty_active_book = require_nonempty_active_book
+        self.snapshot_max_level_size = snapshot_max_level_size
         self.log = logging.getLogger("MarketWSClient")
         self._stop = asyncio.Event()
         self._paused_markets: set[str] = set()
@@ -117,7 +121,12 @@ class MarketWSClient:
         bids = p.get("bids", [])
         asks = p.get("asks", [])
         active = bool(p.get("market_active", True))
-        if is_book_anomalous(bids=bids, asks=asks, market_active=active, require_nonempty_active=True):
+        if is_book_anomalous(
+            bids=bids,
+            asks=asks,
+            market_active=active,
+            require_nonempty_active=self.require_nonempty_active_book,
+        ):
             raise ValueError("book anomaly detected")
 
         self.book_store.upsert(
@@ -128,7 +137,7 @@ class MarketWSClient:
             recv_ts=event.recv_ts,
             exchange_ts=event.exchange_ts,
             active=active,
-            require_nonempty_if_active=True,
+            require_nonempty_if_active=self.require_nonempty_active_book,
         )
 
     async def _handle_book_event(self, event: NormalizedEvent) -> bool:
@@ -154,8 +163,18 @@ class MarketWSClient:
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             snapshots = await asyncio.gather(
-                fetch_token_orderbook(self.rest_url, meta.yes_token_id, session=session),
-                fetch_token_orderbook(self.rest_url, meta.no_token_id, session=session),
+                fetch_token_orderbook(
+                    self.rest_url,
+                    meta.yes_token_id,
+                    session=session,
+                    max_level_size=self.snapshot_max_level_size,
+                ),
+                fetch_token_orderbook(
+                    self.rest_url,
+                    meta.no_token_id,
+                    session=session,
+                    max_level_size=self.snapshot_max_level_size,
+                ),
                 return_exceptions=True,
             )
 
@@ -163,7 +182,12 @@ class MarketWSClient:
             if isinstance(snap, Exception):
                 self.log.error("resync snapshot failed", extra={"market_id": market_id})
                 return
-            if is_book_anomalous(snap.get("bids", []), snap.get("asks", []), bool(snap.get("market_active", True)), True):
+            if is_book_anomalous(
+                snap.get("bids", []),
+                snap.get("asks", []),
+                bool(snap.get("market_active", True)),
+                self.require_nonempty_active_book,
+            ):
                 self.log.error("resync snapshot anomalous", extra={"market_id": market_id})
                 return
             self.book_store.upsert(
@@ -174,7 +198,7 @@ class MarketWSClient:
                 recv_ts=time.time(),
                 exchange_ts=int(snap.get("ts")) if snap.get("ts") else None,
                 active=bool(snap.get("market_active", True)),
-                require_nonempty_if_active=True,
+                require_nonempty_if_active=self.require_nonempty_active_book,
             )
         self._paused_markets.discard(market_id)
         self.log.info("market resynced", extra={"market_id": market_id})

@@ -67,9 +67,9 @@ class BookStore:
             if level.size < 0:
                 raise ValueError("negative size in order book")
         if book.bids and book.asks and book.best_bid() is not None and book.best_ask() is not None:
-            if book.best_bid() > book.best_ask():
+            if book.best_bid() >= book.best_ask():
                 raise ValueError("crossed order book")
-        if require_nonempty_if_active and book.active and (not book.bids or not book.asks):
+        if require_nonempty_if_active and book.active and (not book.bids and not book.asks):
             raise ValueError("empty active book")
 
     def mark_stale(self, market_id: str, token_id: str) -> None:
